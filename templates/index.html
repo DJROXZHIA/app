@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Safe Copy</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+  </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Safe Copy</h1>
+        
+        <section class="card">
+            <h2>Join as a shopkeeper</h2>
+
+            <form method="post" action=" {{ url_for('admin') }} ">
+                <button type="submit">Start</button>
+            </form>
+        </section>
+        
+    </div>
+</body>
+</html>
