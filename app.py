@@ -111,10 +111,14 @@ def print_and_confirm(token):
         return redirect(url_for('admin'))
 
     # If we reached here, printing was started successfully.
-    # Remove entire upload folder and shut down (auto-confirm).
-    #TODO Stop Session
-    
-    cleanup_entire_upload_folder()
+    # Remove entire upload folder for this token and clean token_store.
+    cleanup_entire_upload_folder(Path(UPLOAD_FOLDER) / token)
+    token_store.pop(token, None)
+    # if the current admin session owned this token, clear their session keys
+    if session.get('session_token') == token:
+        session['upload_name'] = None
+        session['file_name'] = None
+        session['session_token'] = None
 
     return render_template('printed.html')
 
@@ -211,8 +215,14 @@ def confirm_print(token, is_admin):
     if not os.path.exists(token_dir):
         return jsonify({"status": "error", "msg": "invalid token"}), 403
     cleanup_entire_upload_folder(Path(token_dir))
+    token_store.pop(token, None)
+    if session.get('session_token') == token:
+        session['upload_name'] = None
+        session['file_name'] = None
+        session['session_token'] = None
     admin = is_admin
-    return redirect(url_for('stop_session', is_admin = admin))
+    # Redirect to stop_session with token so the server can stop the correct session
+    return redirect(url_for('stop_session', token=token, is_admin=admin))
 
 @app.route('/_internal_shutdown_trigger', methods=['GET'])
 def _shutdown_trigger():
@@ -235,17 +245,25 @@ def root():
 def admin():
     #Admin page for shopkeepers
     # Initialize per-user session defaults
-    session.setdefault('session_token', None)
-    session.setdefault('upload_name', None)
-    session.setdefault('file_name', None)
-    session.setdefault('started_at', None)
 
     qr = None
     upload_link = None
     if session.get('session_token'):
+        # Verify session token still exists in DB and the upload folder is present
+        token = session.get('session_token')
+        room = Room.query.filter_by(id=token).first()
+        token_dir = os.path.join(UPLOAD_FOLDER, token)
+        if not room or not os.path.exists(token_dir):
+            # Session expired/removed (maybe uploader confirmed print) — clear and show invalid
+            flash('This session has expired or been closed (invalid token).', 'error')
+            session['session_token'] = None
+            session['upload_name'] = None
+            session['file_name'] = None
+            return render_template('admin.html', active=False, uploaded=False, uploaded_name=None, qr=None, upload_link=None, session_token=None)
+
         public_url = SERVER_PUBLIC_URL
         if public_url:
-            upload_link = f"{public_url}/upload/{session.get('session_token')}"
+            upload_link = f"{public_url}/upload/{token}"
             try:
                 qr = generate_qr_data_url(upload_link)
             except Exception:
@@ -269,15 +287,20 @@ def admin_status():
     #Check status and send back to html
     #polled by admin ui (in admin.html script) for auto-refresh
     
-    session.setdefault('session_token', None)
-    session.setdefault('upload_name', None)
-    session.setdefault('file_name', None)
-    if not session.get('session_token'):
-        return redirect(url_for('root'))
+    # If the admin hasn't started a session, respond with inactive state
+    session_token = session.get('session_token')
+    if not session_token:
+        return jsonify({
+            "active": False,
+            "uploaded": False,
+            "uploaded_name": None,
+            "upload_link": None,
+            "qr": None
+        })
+
     public_url = SERVER_PUBLIC_URL
     upload_link = None
     qr = None
-    session_token = session.get('session_token')
     if session_token and public_url:
         upload_link = f"{public_url}/upload/{session_token}"
         try:
@@ -285,10 +308,19 @@ def admin_status():
         except Exception:
             qr = None
             return "error generating qr code", 500
+
+    # Check server-side token_store for upload metadata (uploader won't have admin cookie)
+    uploaded = False
+    uploaded_name = None
+    meta = token_store.get(session_token)
+    if meta:
+        uploaded = True
+        uploaded_name = meta.get('upload_name')
+
     return jsonify({
         "active": True,
-        "uploaded": bool(session.get('upload_name')),
-        "uploaded_name": session.get('upload_name'),
+        "uploaded": uploaded,
+        "uploaded_name": uploaded_name,
         "upload_link": upload_link,
         "qr": qr
     })
@@ -360,23 +392,35 @@ def upload(token):
         'file_name': unique_name,
         'uploaded_at': datetime.utcnow().isoformat()
     }
+    # If the current user's session corresponds to the admin who created the token,
+    # update their session values so admin_status and admin page reflect the upload.
+    try:
+        # there is no reliable cross-process way to find which admin created the token
+        # because admin session data is cookie-bound; if the uploader is the admin
+        # they'll have the same cookie and this will update their session. This
+        # is primarily useful when admin uploads from same browser.
+        if session.get('session_token') == token:
+            session['upload_name'] = filename
+            session['file_name'] = unique_name
+    except Exception:
+        pass
     flash("File uploaded successfully. The shopkeeper has been notified in their local UI.", "success")
     return render_template('upload.html', message="Upload successful. The shopkeeper will receive the file shortly.", token=token)
 
 #Stop session and delete room from database, and delete uploaded files
 @app.route('/stop_session/<is_admin>', methods=['GET', 'POST'])
-def stop_session(is_admin):
+@app.route('/stop_session/<token>/<is_admin>', methods=['GET', 'POST'])
+def stop_session(is_admin, token=None):
     """Stop the current session, remove DB room if present, clear state and redirect home.
 
     Allowing GET here avoids a Method Not Allowed when other handlers redirect to this
     endpoint after performing POST work.
     """
-    # Stop session - clear the user's Flask session and remove DB room if exists
-    session.setdefault('session_token', None)
-    token = session.get('session_token')
+    # Determine which token to stop: prefer explicit token argument (from uploader confirm)
+    session_token = token or session.get('session_token')
     room = None
-    if token:
-        room = Room.query.filter_by(id=token).first()
+    if session_token:
+        room = Room.query.filter_by(id=session_token).first()
 
     if not room:
         flash("No session found", "error")
@@ -390,18 +434,19 @@ def stop_session(is_admin):
 
     # cleanup upload folder for this token
     try:
-        if token:
-            cleanup_entire_upload_folder(Path(UPLOAD_FOLDER) / token)
-            token_store.pop(token, None)
+        if session_token:
+            cleanup_entire_upload_folder(Path(UPLOAD_FOLDER) / session_token)
+            token_store.pop(session_token, None)
     except Exception:
         pass
 
-    # Clear user's flask session keys
-    session['session_token'] = None
-    session['upload_name'] = None
-    session['started_at'] = None
+    # If the user's flask session owned this token, clear their session keys
+    if session.get('session_token') == session_token:
+        session['session_token'] = None
+        session['upload_name'] = None
+        session['started_at'] = None
 
-    if is_admin == 1:
+    if str(is_admin) == '1':
         return redirect(url_for('root'))
     else:
         return render_template('printed.html')
@@ -410,13 +455,11 @@ if __name__ == '__main__':
     with app.app_context():   # Create database tables if they don't exist
         db.create_all()
     
-    """
     tunnel = ngrok.connect(5000)
     public_url = tunnel.public_url
-    current_session_state['public_url'] = public_url
     print(f"public url: {public_url}")
-    app.run(port=5000, debug=True)
-    
+ 
+ 
     try:
         app.run(debug=True, port=5000)
     finally:
@@ -425,11 +468,10 @@ if __name__ == '__main__':
         except Exception:
             pass
         ngrok.kill()
-    """
-
-    SERVER_PUBLIC_URL = ngrok.connect(5000).public_url
-    print(f"public url: {SERVER_PUBLIC_URL}")
-    app.run(debug=True, port=5000)
+ 
+    #SERVER_PUBLIC_URL = ngrok.connect(5000).public_url
+    #print(f"public url: {SERVER_PUBLIC_URL}")
+    #app.run(debug=True, port=5000)
 
 
 #TODO: change uploads folder to tmp    
